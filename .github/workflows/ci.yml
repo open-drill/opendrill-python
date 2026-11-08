@@ -1,0 +1,61 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install package and test tools
+        run: python -m pip install -e ".[dev]"
+      - name: Run tests
+        run: python -m pytest
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install build twine
+          python -m build
+      - name: Check metadata and bundled license
+        run: |
+          twine check dist/*
+          python - << 'PY'
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with zipfile.ZipFile(wheel) as archive:
+              names = archive.namelist()
+              assert any(name.endswith("/LICENSE") or name == "LICENSE" for name in names), names
+              metadata = archive.read(next(name for name in names if name.endswith("METADATA"))).decode()
+              assert "License-Expression: MIT" in metadata, metadata
+              assert "License-File: LICENSE" in metadata, metadata
+          sdist = next(Path("dist").glob("*.tar.gz"))
+          with tarfile.open(sdist) as archive:
+              names = archive.getnames()
+              assert any(name.endswith("/LICENSE") for name in names), names
+          PY
+      - name: Install the wheel in a clean environment and smoke the CLI
+        run: |
+          python -m venv /tmp/opendrill-wheel
+          /tmp/opendrill-wheel/bin/pip install dist/*.whl
+          /tmp/opendrill-wheel/bin/opendrill example pdf --out /tmp/synthetic.pdf
+          test -s /tmp/synthetic.pdf
+          /tmp/opendrill-wheel/bin/python -c "import opendrill,sys; assert 'tkinter' not in sys.modules"

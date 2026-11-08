@@ -1,0 +1,38 @@
+# Publishes to PyPI when a GitHub Release is published for a tag such as v0.1.0. Uses PyPI Trusted Publishing:
+# on pypi.org, the opendrill project has this repository, this workflow and the "pypi" environment
+# as a trusted publisher, so no API token is stored anywhere.
+name: publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --python 3.12 --extra dev pytest -q
+      - run: uv build
+      - name: The tag matches the package version
+        run: |
+          version=$(uv run --python 3.12 python -c "import opendrill; print(opendrill.__version__)")
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "Tag $GITHUB_REF_NAME doesn't match version $version"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
