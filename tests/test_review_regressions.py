@@ -1,0 +1,318 @@
+"""Regression tests for the findings of the first external review (v0.1.0)."""
+import json
+import os
+import re
+import shlex
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from opendrill import validate_log
+from opendrill.cli import main
+from opendrill.errors import InputError, PayloadError
+from opendrill.excel_io import build_workbook, read_workbook
+from opendrill.layout import (
+    MAX_PAGE_LINES,
+    contains_point,
+    data_page_windows,
+    depth_axis,
+    depth_marks,
+    grid_depth_step_m,
+    log_extent_m,
+)
+from opendrill.render import render_log
+from opendrill.synthetic import synthetic_payload
+from tests.conftest import base_payload, page_text
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+# 1. Fractional page boundaries
+
+
+def test_fractional_terminal_sample_is_drawn_once():
+    payload = {
+        "depth_per_sheet_m": 0.3,
+        "tests": [
+            {"depth_top_m": 0.9, "depth_bot_m": 0.9, "test": "SPT", "spt1": 2, "spt2": 3, "spt3": 4}
+        ],
+    }
+    windows = data_page_windows(log_extent_m(payload), 0.3)
+    assert len(windows) == 3
+    assert windows[-1][1] < 0.9  # 3 * 0.3 is 0.8999999999999999
+    owners = [w for w in windows if contains_point(0.9, *w)]
+    assert owners == [windows[-1]]
+
+    result = render_log(payload)
+    labels = sum(text.count("2/3/4") for text in page_text(result.pdf_bytes))
+    assert labels == 1
+
+
+def test_a_depth_on_a_shared_boundary_has_one_owner():
+    for dps in (0.1, 0.3, 0.7, 1.1, 2.05, 3.3):
+        windows = data_page_windows(dps * 7, dps)
+        for index in range(1, len(windows)):
+            boundary = index * dps
+            owners = [w for w in windows if contains_point(boundary, *w)]
+            assert owners == [windows[index - 1]], (dps, index)
+
+
+# 4. Depth ticks at real depths
+
+
+def test_fractional_sheet_ticks_align_with_depth_labels():
+    axis = depth_axis(0, 2.05)
+    ticks = axis.ticks()
+    depths = [depth for depth, _major in ticks]
+    assert depths[-1] == pytest.approx(2.05)
+    for depth in depths[:-1]:
+        assert depth * 10 == pytest.approx(round(depth * 10)), depth
+    majors = [depth for depth, major in ticks if major]
+    assert majors == pytest.approx([0.0, 1.0, 2.0, 2.05])
+    for label in axis.label_depths_m:
+        assert any(abs(label - depth) < 1e-9 for depth in majors), label
+
+    grid = depth_marks(0, 2.05, grid_depth_step_m(2.05))
+    assert grid == pytest.approx([0.0, 0.5, 1.0, 1.5, 2.0, 2.05])
+
+
+# 5. Drawing work per page is bounded
+
+
+def test_render_primitive_counts_are_bounded():
+    with pytest.raises(PayloadError) as info:
+        validate_log({"piezo": {"top_screen_m": 0, "bottom_screen_m": 1, "screen_line_spacing_m": 1e-12}})
+    assert any(loc == ("piezo", "screen_line_spacing_m") for loc, _msg, _value in info.value.errors)
+
+    for span in (1e12, 1e6, 5000, 20, 2.05, 0.3):
+        assert len(depth_axis(0, span).ticks()) <= MAX_PAGE_LINES + 1, span
+        assert span / grid_depth_step_m(span) <= MAX_PAGE_LINES, span
+
+    started = time.monotonic()
+    result = render_log({"depth_per_sheet_m": 1e12, "layers": [{"depth_start_m": 0, "depth_end_m": 1}]})
+    assert result.page_count == 1
+    assert time.monotonic() - started < 10
+
+
+# 6. "samples" alias is not carried into the normalised payload
+
+
+def test_normalized_samples_payload_can_be_rendered_and_revalidated():
+    checked = validate_log({"samples": [{"depth_top_m": 1, "depth_bot_m": 2, "w_pct": 20}]})
+    assert "samples" not in checked.payload
+    assert len(checked.payload["tests"]) == 1
+    validate_log(checked.payload)
+    assert render_log(checked.payload).pdf_bytes.startswith(b"%PDF")
+
+
+# 7. Notes follow a deeper termination on a later page
+
+
+def test_notes_follow_termination_on_later_page():
+    payload = base_payload(
+        depth_per_sheet_m=10,
+        layers=[{"depth_start_m": 0, "depth_end_m": 2, "soil_type": "SAND", "desc": "sand"}],
+        termination_depth_m=16,
+        notes="ENDNOTE",
+    )
+    pages = page_text(render_log(payload).pdf_bytes)
+    assert len(pages) == 2
+    assert "ENDNOTE" not in pages[0]
+    assert "ENDNOTE" in pages[1]
+    assert "Termination depth" in pages[1]
+
+
+# 8. Excel booleans are not depths
+
+
+@pytest.mark.parametrize("key", ["depth_per_sheet_m", "termination_depth_m"])
+def test_excel_settings_reject_boolean_depths(tmp_path: Path, key: str):
+    workbook = build_workbook(synthetic_payload(), filled=True)
+    sheet = workbook["Settings"]
+    row = next(r for r in range(2, sheet.max_row + 1) if sheet.cell(row=r, column=1).value == key)
+    sheet.cell(row=row, column=2, value=True)
+    path = tmp_path / "bool.xlsx"
+    workbook.save(path)
+    with pytest.raises(InputError, match="boolean"):
+        read_workbook(path)
+
+
+# 3. Sparse workbooks are rejected before expansion
+
+
+def test_sparse_oversized_workbook_rejected_before_expansion(tmp_path: Path):
+    workbook = build_workbook(synthetic_payload(), filled=True)
+    workbook["Samples"].cell(row=100000, column=100, value=1)
+    path = tmp_path / "sparse.xlsx"
+    workbook.save(path)
+    assert path.stat().st_size < 100_000
+    started = time.monotonic()
+    with pytest.raises(InputError, match="limit"):
+        read_workbook(path)
+    assert time.monotonic() - started < 5
+
+
+def test_formatting_only_rows_do_not_count_toward_sheet_limits(tmp_path: Path):
+    from openpyxl.styles import Font
+
+    workbook = build_workbook(synthetic_payload(), filled=True)
+    sheet = workbook["Samples"]
+    for row in range(2, 8001):
+        sheet.cell(row=row, column=1).font = Font(bold=True)
+    path = tmp_path / "formatted.xlsx"
+    workbook.save(path)
+    data = read_workbook(path)
+    assert len(data.payload["tests"]) == len(synthetic_payload()["tests"])
+
+
+# 9. Malformed JSON is a clean error
+
+
+def test_invalid_encoding_and_deep_json_exit_two(tmp_path: Path, capsys):
+    bad_bytes = tmp_path / "bytes.json"
+    bad_bytes.write_bytes(b'{"notes": "\xff"}')
+    assert main(["validate", str(bad_bytes)]) == 2
+    assert "UTF-8" in capsys.readouterr().err
+
+    deep = tmp_path / "deep.json"
+    deep.write_text('{"a": ' + "[" * 100_000 + "]" * 100_000 + "}", encoding="utf-8")
+    assert main(["validate", str(deep)]) == 2
+    assert "nested too deeply" in capsys.readouterr().err
+
+
+# 10. Extreme numbers are validation errors
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"depth_per_sheet_m": 1e-320, "termination_depth_m": 1},
+        {"termination_depth_m": 10**400},
+        {"layers": [{"depth_start_m": 0, "depth_end_m": "1e400"}]},
+    ],
+)
+def test_extreme_numbers_raise_payload_error(payload):
+    with pytest.raises(PayloadError):
+        validate_log(payload)
+
+
+# 2. Output never touches a guessable temporary name
+
+
+def _render_args(tmp_path: Path) -> list[str]:
+    source = tmp_path / "hole.json"
+    source.write_text(json.dumps(base_payload()), encoding="utf-8")
+    return ["render", str(source), "--out"]
+
+
+def test_output_preserves_existing_temp_files_and_symlinks(tmp_path: Path):
+    args = _render_args(tmp_path)
+    stale = tmp_path / "out.pdf.tmp"
+    stale.write_text("keep me", encoding="utf-8")
+    assert main(args + [str(tmp_path / "out.pdf")]) == 0
+    assert stale.read_text(encoding="utf-8") == "keep me"
+
+    if hasattr(os, "symlink"):
+        victim = tmp_path / "victim.txt"
+        victim.write_text("untouched", encoding="utf-8")
+        (tmp_path / "second.pdf.tmp").symlink_to(victim)
+        assert main(args + [str(tmp_path / "second.pdf")]) == 0
+        assert victim.read_text(encoding="utf-8") == "untouched"
+        assert (tmp_path / "second.pdf").read_bytes().startswith(b"%PDF")
+
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".") and p.name.endswith(".tmp")]
+    assert leftovers == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_output_file_gets_normal_permissions(tmp_path: Path):
+    out = tmp_path / "perm.pdf"
+    umask = os.umask(0o022)
+    try:
+        assert main(_render_args(tmp_path) + [str(out)]) == 0
+    finally:
+        os.umask(umask)
+    assert out.stat().st_mode & 0o777 == 0o644
+
+
+def test_existing_output_is_not_replaced_without_force(tmp_path: Path):
+    out = tmp_path / "out.pdf"
+    out.write_text("original", encoding="utf-8")
+    assert main(_render_args(tmp_path) + [str(out)]) == 2
+    assert out.read_text(encoding="utf-8") == "original"
+    assert main(_render_args(tmp_path) + [str(out), "--force"]) == 0
+    assert out.read_bytes().startswith(b"%PDF")
+
+
+# 11. Filesystem errors on output are clean errors
+
+
+def test_invalid_output_parent_returns_clear_error(tmp_path: Path, capsys):
+    blocked = tmp_path / "blocked"
+    blocked.write_text("a file, not a folder", encoding="utf-8")
+    args = _render_args(tmp_path)
+    capsys.readouterr()
+    assert main(args + [str(blocked / "out.pdf")]) == 2
+    assert "cannot" in capsys.readouterr().err
+    assert main(["example", "json", "--out", str(blocked / "x.json")]) == 2
+    assert main(["template", "--out", str(blocked / "x.xlsx")]) == 2
+
+
+# 12. Workflow policy
+
+
+def test_workflow_actions_are_pinned_and_permissions_explicit():
+    for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+        text = path.read_text(encoding="utf-8")
+        assert re.search(r"^permissions:", text, re.MULTILINE), path.name
+        for ref in re.findall(r"uses:\s*(\S+)", text):
+            assert re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", ref), f"{path.name}: {ref}"
+        header = "\n".join(
+            line for line in text.split("\njobs:", 1)[0].splitlines() if not line.lstrip().startswith("#")
+        )
+        assert "id-token: write" not in header, path.name
+
+
+# 13. Old package name only where it is meant to be
+
+
+def test_old_package_names_only_appear_in_allowed_locations():
+    allowed = {
+        Path("README.md"): "It was first developed as `soil-log`.",
+        Path("pyproject.toml"): '"soil-log"]',
+    }
+    offenders = []
+    for path in ROOT.rglob("*"):
+        relative = path.relative_to(ROOT)
+        if not path.is_file() or relative.parts[0] in {".git", ".venv", "dist", "build"}:
+            continue
+        if "__pycache__" in relative.parts or relative == Path(__file__).relative_to(ROOT):
+            continue
+        if path.suffix not in {".py", ".md", ".toml", ".yml", ".json", ".txt", ".in"}:
+            continue
+        for number, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+            if re.search(r"soil[_-]log", line) and allowed.get(relative, "\0") not in line:
+                offenders.append(f"{relative}:{number}")
+    assert offenders == []
+
+
+# 14. README commands run in sequence
+
+
+def test_readme_quickstart_commands_run_in_sequence(tmp_path: Path, monkeypatch):
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    section = readme.split("## Quickstart", 1)[1].split("## Python API", 1)[0]
+    blocks = re.findall(r"```bash\n(.*?)```", section, re.DOTALL)
+    commands = [
+        shlex.split(line)
+        for block in blocks
+        for line in block.splitlines()
+        if line.startswith("opendrill ") and "<<" not in line and "hole.json" not in line
+    ]
+    assert len(commands) >= 6
+    monkeypatch.chdir(tmp_path)
+    for command in commands:
+        assert command[0] == "opendrill"
+        assert main(command[1:]) == 0, command

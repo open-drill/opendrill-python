@@ -10,6 +10,7 @@ Duplicate keys in a KEY/VALUE sheet are an error; the last value does not win.
 """
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
@@ -22,6 +23,19 @@ from opendrill.errors import InputError, PayloadError
 from opendrill.validate import SOIL_TYPES, SU_KINDS, TEST_TYPES
 
 _COMMENT_AUTHOR = "opendrill"
+
+# Input limits. A real borehole log workbook is tens of kilobytes with a few
+# hundred rows. The limits stop a small file from expanding into a huge
+# in-memory sheet: the archive is checked before openpyxl parses it, the
+# number of cells stored in each sheet is capped, and rows are read only as
+# far as the last cell that holds a value. Cells that carry formatting but
+# no value (Excel writes these when formatting is copied down a column) do
+# not count toward the row and column limits.
+MAX_WORKBOOK_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+MAX_WORKBOOK_ENTRIES = 2000
+MAX_SHEET_CELLS = 200_000
+MAX_SHEET_ROWS = 5000
+MAX_SHEET_COLUMNS = 64
 
 SHEET_ALIASES = {
     "info": ("Project", "project info", "info"),
@@ -367,9 +381,57 @@ def _cached_value(formula_cell, data_cell, sheet: str, coordinate: str, warnings
     return cached
 
 
+def _check_archive(path: Path) -> None:
+    """Reject a workbook whose ZIP contents would expand past the input limits."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            entries = archive.infolist()
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise InputError(f"cannot open {path.name} as an Excel workbook: {exc}") from exc
+    if len(entries) > MAX_WORKBOOK_ENTRIES:
+        raise InputError(
+            f"{path.name} has {len(entries)} parts inside the workbook file; "
+            f"the limit is {MAX_WORKBOOK_ENTRIES}"
+        )
+    total = sum(entry.file_size for entry in entries)
+    if total > MAX_WORKBOOK_UNCOMPRESSED_BYTES:
+        raise InputError(
+            f"{path.name} expands to {total:,} bytes; the limit is "
+            f"{MAX_WORKBOOK_UNCOMPRESSED_BYTES:,} bytes"
+        )
+
+
+def _value_extent(ws, name: str) -> tuple[int, int]:
+    """Last row and column holding a value, after checking the sheet's size.
+
+    Uses the cells openpyxl actually stored, so the cost follows the file's
+    contents, not the rectangle Excel reports as the used range.
+    """
+    cells = getattr(ws, "_cells", None)
+    if cells is None:  # pragma: no cover - other openpyxl internals
+        return ws.max_row, ws.max_column
+    if len(cells) > MAX_SHEET_CELLS:
+        raise InputError(
+            f"{name} sheet stores {len(cells):,} cells; the limit is {MAX_SHEET_CELLS:,}"
+        )
+    rows = cols = 0
+    for (row, col), cell in cells.items():
+        if cell.value is not None:
+            rows = max(rows, row)
+            cols = max(cols, col)
+    if rows > MAX_SHEET_ROWS or cols > MAX_SHEET_COLUMNS:
+        raise InputError(
+            f"{name} sheet has values as far as row {rows} and column {cols}; "
+            f"the limit is {MAX_SHEET_ROWS} rows and {MAX_SHEET_COLUMNS} columns. "
+            "Delete stray values far below or to the right of the data."
+        )
+    return rows, cols
+
+
 def read_workbook(path: Path) -> WorkbookData:
     """Read an ``.xlsx`` or ``.xlsm`` log into a payload."""
     path = Path(path)
+    _check_archive(path)
     try:
         formulas = load_workbook(path, data_only=False)
         cached = load_workbook(path, data_only=True)
@@ -386,6 +448,13 @@ def read_workbook(path: Path) -> WorkbookData:
             f"{path.name} has none of the expected sheets. Found: {', '.join(formulas.sheetnames)}. "
             "Expected some of: Project, Layers, Samples, Piezo, Notes, Settings."
         )
+    # Rows and columns to read per sheet. At least 1 x 1: openpyxl treats a
+    # bound of 0 as "no bound" and would fall back to the full used range.
+    extent: dict[str, tuple[int, int]] = {}
+    for sheet_name in out.sheet_names.values():
+        rows_f, cols_f = _value_extent(formulas[sheet_name], sheet_name)
+        rows_d, cols_d = _value_extent(cached[sheet_name], sheet_name)
+        extent[sheet_name] = (max(rows_f, rows_d, 1), max(cols_f, cols_d, 1))
 
     def kv_items(canonical: str):
         sheet_name = out.sheet_names[canonical]
@@ -393,7 +462,10 @@ def read_workbook(path: Path) -> WorkbookData:
         ws_d = cached[sheet_name]
         seen: dict[str, int] = {}
         for row_no, (_f_row, d_row) in enumerate(
-            zip(ws_f.iter_rows(min_col=1, max_col=2), ws_d.iter_rows(min_col=1, max_col=2)),
+            zip(
+                ws_f.iter_rows(min_col=1, max_col=2, max_row=extent[sheet_name][0]),
+                ws_d.iter_rows(min_col=1, max_col=2, max_row=extent[sheet_name][0]),
+            ),
             1,
         ):
             key_cell, value_cell = _f_row[0], _f_row[1]
@@ -431,14 +503,19 @@ def read_workbook(path: Path) -> WorkbookData:
             return []
         ws_f = formulas[name]
         ws_d = cached[name]
-        rows_f = list(ws_f.iter_rows())
-        rows_d = list(ws_d.iter_rows())
-        if not rows_f:
+        max_row, max_col = extent[name]
+        pairs = zip(
+            ws_f.iter_rows(max_row=max_row, max_col=max_col),
+            ws_d.iter_rows(max_row=max_row, max_col=max_col),
+        )
+        first = next(pairs, None)
+        if first is None:
             return []
+        header_f, header_d = first
         headers = []
         seen_headers: dict[str, int] = {}
-        for column, cell in enumerate(rows_f[0], 1):
-            data_cell = rows_d[0][column - 1]
+        for column, cell in enumerate(header_f, 1):
+            data_cell = header_d[column - 1]
             raw = _cached_value(cell, data_cell, name, cell.coordinate, out.warnings)
             if not raw:
                 headers.append("")
@@ -453,7 +530,7 @@ def read_workbook(path: Path) -> WorkbookData:
             seen_headers[key] = column
             headers.append(key)
         result = []
-        for row_no, (f_row, d_row) in enumerate(zip(rows_f[1:], rows_d[1:]), 2):
+        for row_no, (f_row, d_row) in enumerate(pairs, 2):
             values = []
             any_value = False
             for f_cell, d_cell in zip(f_row, d_row):
@@ -493,8 +570,8 @@ def read_workbook(path: Path) -> WorkbookData:
         sheet_name = out.sheet_names["notes"]
         parts = []
         for f_row, d_row in zip(
-            formulas[sheet_name].iter_rows(min_col=1, max_col=1),
-            cached[sheet_name].iter_rows(min_col=1, max_col=1),
+            formulas[sheet_name].iter_rows(min_col=1, max_col=1, max_row=extent[sheet_name][0]),
+            cached[sheet_name].iter_rows(min_col=1, max_col=1, max_row=extent[sheet_name][0]),
         ):
             value = _cached_value(f_row[0], d_row[0], sheet_name, f_row[0].coordinate, out.warnings)
             if value is not None:
@@ -514,6 +591,11 @@ def read_workbook(path: Path) -> WorkbookData:
                 continue
             if value is None:
                 continue
+            if isinstance(value, bool):
+                raise InputError(
+                    f"{out.sheet_names['meta']} sheet, row {row_no}: {key} "
+                    f"must be a number in metres (got the Excel boolean {value!r})"
+                )
             try:
                 number = float(value)
             except (TypeError, ValueError):

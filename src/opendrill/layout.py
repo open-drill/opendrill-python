@@ -18,10 +18,21 @@ DEPTH_TOL_M = 1e-6
 # of pages. The error tells the caller to increase the sheet length.
 MAX_PAGES = 200
 
+# Safety stop for drawing work inside one page. Depth-axis ticks, grid lines,
+# and piezometer screen lines are each kept at or below this count, so a huge
+# sheet length or a tiny line spacing cannot request millions of strokes.
+MAX_PAGE_LINES = 1000
+
 
 def contains_point(depth: float, page_start: float, page_end: float) -> bool:
-    """Return whether ``depth`` (metres) belongs to this page window."""
-    if page_start < depth <= page_end:
+    """Return whether ``depth`` (metres) belongs to this page window.
+
+    Page edges are computed as ``i * depth_per_sheet_m`` and are not exact
+    in binary floating point (3 * 0.3 is 0.8999999999999999). A depth within
+    :data:`DEPTH_TOL_M` of an edge is treated as lying on it, so it belongs
+    to the page that ends there and to no other page.
+    """
+    if page_start + DEPTH_TOL_M < depth <= page_end + DEPTH_TOL_M:
         return True
     # Keep 0 m on the first page. Every later window starts above 0.
     if page_start == 0 and abs(depth) <= DEPTH_TOL_M:
@@ -66,6 +77,31 @@ def clip_interval(
     return (top, bot)
 
 
+def depth_marks(start_m: float, end_m: float, step_m: float) -> list[float]:
+    """Depths ``start + k * step`` inside the window, then ``end`` itself.
+
+    Marks sit at real depth increments, so a sheet whose length is not a
+    whole number of steps does not stretch them away from their labels. The
+    page end is always the last mark. The count is capped by
+    :data:`MAX_PAGE_LINES`.
+    """
+    span = end_m - start_m
+    if not math.isfinite(span) or span <= 0 or not math.isfinite(step_m) or step_m <= 0:
+        raise ValueError("depth span and step must be finite and positive")
+    if span / step_m > MAX_PAGE_LINES:
+        raise ValueError("too many depth marks for one page")
+    marks: list[float] = []
+    k = 0
+    while True:
+        depth = start_m + k * step_m
+        if depth >= end_m - DEPTH_TOL_M:
+            break
+        marks.append(depth)
+        k += 1
+    marks.append(end_m)
+    return marks
+
+
 def format_depth(value: float) -> str:
     """Format a depth in metres without a trailing ``.0``."""
     if abs(value - round(value)) <= DEPTH_TOL_M:
@@ -107,6 +143,19 @@ class DepthAxis:
     def minor_step_m(self) -> float:
         return self.major_step_m / self.minor_divisions
 
+    def ticks(self) -> list[tuple[float, bool]]:
+        """``(depth_m, is_major)`` for every tick, at real depth increments.
+
+        The page end gets a major tick even when it is not a whole number of
+        minor steps from the page start.
+        """
+        marks = depth_marks(self.start_m, self.end_m, self.minor_step_m)
+        last = len(marks) - 1
+        return [
+            (depth, index % self.minor_divisions == 0 or index == last)
+            for index, depth in enumerate(marks)
+        ]
+
     @property
     def minor_count(self) -> int:
         span = self.end_m - self.start_m
@@ -128,25 +177,21 @@ def depth_axis(start_m: float, end_m: float) -> DepthAxis:
     span = end_m - start_m
     if not math.isfinite(span) or span <= 0:
         raise ValueError("depth span must be finite and positive")
-    if span + DEPTH_TOL_M >= 2:
+    if span + DEPTH_TOL_M >= 2 and span <= MAX_PAGE_LINES / 10:
         major = 1.0
         divisions = 10
+    elif span > MAX_PAGE_LINES / 10:
+        # Very long sheets: keep the 1-2-5 major step and 5 minor ticks per
+        # major, so the tick count stays bounded.
+        major = _nice_step(span, 10)
+        divisions = 5
     else:
         major = _nice_step(span, 8)
         divisions = 5
         if major <= 0 or major > span:
             major = span
             divisions = 2
-    labels: list[float] = []
-    k = 1
-    while k < 100000:
-        depth = start_m + k * major
-        if depth >= end_m - DEPTH_TOL_M:
-            break
-        labels.append(depth)
-        k += 1
-    if not labels or abs(labels[-1] - end_m) > DEPTH_TOL_M:
-        labels.append(end_m)
+    labels = depth_marks(start_m, end_m, major)[1:]
     return DepthAxis(start_m, end_m, major, divisions, tuple(labels))
 
 
@@ -167,6 +212,8 @@ def grid_depth_step_m(span_m: float) -> float:
         step = 0.5
     if step <= 0 or span_m / step < 0.5:
         step = _nice_step(span_m, 8)
+    elif span_m / step > MAX_PAGE_LINES:
+        step = _nice_step(span_m, 40)
     if not math.isfinite(step) or step <= 0 or step > span_m:
         step = span_m
     return step
@@ -189,6 +236,10 @@ def sheet_count(extent_m: float, depth_per_sheet_m: float) -> int:
     if extent_m <= DEPTH_TOL_M:
         return 1
     ratio = extent_m / depth_per_sheet_m
+    if not math.isfinite(ratio) or ratio > 10 * MAX_PAGES:
+        # Callers compare against MAX_PAGES. Report "too many" without
+        # rounding an infinite or astronomically large ratio.
+        return 10 * MAX_PAGES + 1
     if abs(ratio - round(ratio)) <= 1e-6:
         count = int(round(ratio))
     else:

@@ -32,7 +32,7 @@ Excel still works:
 ```bash
 opendrill template --out blank.xlsx
 opendrill example xlsx --out synthetic.xlsx
-opendrill render synthetic.xlsx --out synthetic.pdf
+opendrill render synthetic.xlsx --out synthetic-from-xlsx.pdf
 ```
 
 The older flags are still there: `--template`, `--example`, `--example-pdf`, and a workbook path as the only argument.
@@ -41,7 +41,7 @@ Existing output files are left untouched unless you pass `--force`. The command 
 
 ```bash
 opendrill render hole.json --out hole.pdf
-opendrill render - --out hole.pdf <<'EOF'
+opendrill render - --out hole-from-stdin.pdf <<'EOF'
 {"layers":[{"depth_start_m":0,"depth_end_m":2,"soil_type":"SAND","desc":"Synthetic sand"}]}
 EOF
 ```

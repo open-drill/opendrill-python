@@ -40,13 +40,15 @@ from opendrill.geometry import (
     WP_LINES,
 )
 from opendrill.layout import (
+    MAX_PAGE_LINES,
     MAX_PAGES,
     contains_point,
     clip_interval,
     data_page_windows,
     depth_axis,
+    depth_marks,
     format_depth,
-    grid_line_count,
+    grid_depth_step_m,
     log_extent_m,
     overlaps_interval,
 )
@@ -164,7 +166,7 @@ def render_log(payload: dict, text_scale: float | None = None) -> RenderResult:
     dps = float(payload["depth_per_sheet_m"])
     windows = data_page_windows(log_extent_m(payload), dps)
     note_lines = _wrap_paragraphs(payload.get("notes") or "", frame.col_w - 2 * _PAD_X)
-    start = _note_start_index(payload.get("layers") or [], windows)
+    start = _note_start_index(payload, windows)
     pages: list[PageText] = []
     remaining = note_lines
     for index, window in enumerate(windows):
@@ -352,8 +354,16 @@ def _wrap_paragraphs(text: str, max_w: float) -> list[str]:
     return lines
 
 
-def _note_start_index(layers: list[dict], windows: list[tuple[float, float]]) -> int:
-    ends = [layer["depth_end_m"] for layer in layers if layer.get("depth_end_m") is not None]
+def _note_start_index(payload: dict, windows: list[tuple[float, float]]) -> int:
+    """Page where notes start: under the last layer, or under a deeper supplied termination."""
+    ends = [
+        layer["depth_end_m"]
+        for layer in payload.get("layers") or []
+        if layer.get("depth_end_m") is not None
+    ]
+    termination = payload.get("termination_depth_m")
+    if termination is not None:
+        ends.append(float(termination))
     if not ends:
         return 0
     last = max(ends)
@@ -862,13 +872,11 @@ def _draw_depth_axis(pdf, frame: Frame, window: tuple[float, float]) -> None:
     spine_x = (_tx(DEPTH_LINES[0][0][0]) + _tx(DEPTH_LINES[0][-1][0])) / 2.0
     pdf.setLineWidth(0.4)
     pdf.line(spine_x, py_top, spine_x, py_bot)
-    n_minor = axis.minor_count
     span_pts = py_top - py_bot
     pdf.setLineWidth(0.25)
-    for step in range(n_minor + 1):
-        frac = step / n_minor
+    for depth, major in axis.ticks():
+        frac = (depth - start) / (end - start)
         y = py_top - frac * span_pts
-        major = step % axis.minor_divisions == 0 or step == n_minor
         tick = (TICK_MAJOR_MM if major else TICK_MINOR_MM) * mm
         pdf.line(spine_x, y, spine_x + tick, y)
     pdf.setFont("Helvetica", LABEL_FONT_PT)
@@ -917,7 +925,7 @@ def _mark_edge(pdf, x: float, y: float, side: str) -> None:
 def _draw_grid_and_series(pdf, payload, frame: Frame, window, warnings: list[str]) -> None:
     start, end = window
     span = end - start
-    n_h = grid_line_count(span)
+    grid_depths = depth_marks(start, end, grid_depth_step_m(span))
     pdf.saveState()
     pdf.setStrokeColorRGB(0, 0, 0)
     pdf.setLineWidth(GRID_LINE_WIDTH)
@@ -925,8 +933,8 @@ def _draw_grid_and_series(pdf, payload, frame: Frame, window, warnings: list[str
     for step in range(n_v + 1):
         x = frame.gx_l + step / n_v * (frame.gx_r - frame.gx_l)
         pdf.line(x, frame.gy_top, x, frame.gy_bot)
-    for step in range(n_h + 1):
-        y = frame.gy_top - step / n_h * (frame.gy_top - frame.gy_bot)
+    for depth in grid_depths:
+        y = frame.gy_top - (depth - start) / span * (frame.gy_top - frame.gy_bot)
         pdf.line(frame.gx_l, y, frame.gx_r, y)
     pdf.restoreState()
 
@@ -1160,6 +1168,9 @@ def _draw_piezo(pdf, payload, frame: Frame, window) -> None:
             y_bot = _ty(_dxf_depth_y(clipped[1], window, frame))
             spacing = piezo.get("screen_line_spacing_m") or 0.1
             n_lines = max(1, int(round((clipped[1] - clipped[0]) / spacing)))
+            # Validation rejects spacings that need more lines than this; the
+            # cap keeps a payload that skipped validation bounded too.
+            n_lines = min(n_lines, MAX_PAGE_LINES)
             pdf.saveState()
             pdf.setLineWidth(0.3)
             for step in range(1, n_lines):

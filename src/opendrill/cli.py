@@ -9,12 +9,17 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
+from typing import Callable, IO
 
 from opendrill.errors import InputError, PayloadError
 from opendrill.synthetic import synthetic_payload
 
 _COMMANDS = {"render", "validate", "template", "example"}
+
+# Largest JSON input read, in bytes. A borehole log is kilobytes.
+MAX_JSON_BYTES = 20 * 1024 * 1024
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -219,8 +224,8 @@ def _load(source: str):
     if source == "-":
         if sys.stdin.isatty():
             raise InputError("stdin is a terminal; pass a JSON file or pipe a payload")
-        text = sys.stdin.read()
-        payload = _parse_json(text, "stdin")
+        data = sys.stdin.buffer.read(MAX_JSON_BYTES + 1)
+        payload = _parse_json(data, "stdin")
         return payload, None, []
     path = Path(source).expanduser()
     if not path.exists():
@@ -228,10 +233,11 @@ def _load(source: str):
     suffix = path.suffix.lower()
     if suffix == ".json":
         try:
-            text = path.read_text(encoding="utf-8")
+            with path.open("rb") as handle:
+                data = handle.read(MAX_JSON_BYTES + 1)
         except OSError as exc:
             raise InputError(f"cannot read {path}: {exc}") from exc
-        return _parse_json(text, path.name), None, []
+        return _parse_json(data, path.name), None, []
     if suffix in (".xlsx", ".xlsm"):
         from opendrill.excel_io import input_warnings, read_workbook
 
@@ -242,11 +248,19 @@ def _load(source: str):
     )
 
 
-def _parse_json(text: str, label: str) -> dict:
+def _parse_json(raw: bytes, label: str) -> dict:
+    if len(raw) > MAX_JSON_BYTES:
+        raise InputError(f"{label}: JSON input is larger than {MAX_JSON_BYTES:,} bytes")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise InputError(f"{label}: JSON must be UTF-8 text ({exc.reason} at byte {exc.start})") from exc
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise InputError(f"{label}: invalid JSON ({exc})") from exc
+    except RecursionError as exc:
+        raise InputError(f"{label}: JSON is nested too deeply") from exc
     if not isinstance(data, dict):
         raise InputError(f"{label}: JSON root must be an object")
     return data
@@ -304,41 +318,75 @@ def _emit_pdf(path: Path | None, data: bytes, force: bool) -> None:
             _silence_broken_pipe()
             raise
         return
-    _refuse_overwrite(path, force)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    try:
-        temporary.write_bytes(data)
-        temporary.replace(path)
-    except PermissionError as exc:
-        raise InputError(f"cannot write {path}: {exc}") from exc
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    _write_atomic(path, lambda handle: handle.write(data), force)
 
 
 def _write_text(path: Path, text: str, force: bool) -> None:
-    _refuse_overwrite(path, force)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(text, encoding="utf-8")
-    temporary.replace(path)
+    _write_atomic(path, lambda handle: handle.write(text.encode("utf-8")), force)
 
 
 def _save_workbook(workbook, path: Path, force: bool) -> None:
     if path.suffix.lower() not in (".xlsx", ".xlsm"):
         path = path.with_suffix(".xlsx")
+    _write_atomic(path, workbook.save, force)
+
+
+def _write_atomic(path: Path, write: Callable[[IO[bytes]], object], force: bool) -> None:
+    """Write ``path`` through a new, uniquely named temporary file beside it.
+
+    The temporary file is created exclusively (``mkstemp``), so an existing
+    file or symlink with a guessable name is never opened or removed. Without
+    ``force`` the result is linked into place, which fails rather than
+    replacing a file that appeared after the existence check. Every
+    filesystem failure becomes an :class:`InputError`.
+    """
     _refuse_overwrite(path, force)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
     try:
-        workbook.save(temporary)
-        temporary.replace(path)
-    except PermissionError as exc:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise InputError(f"cannot create the folder for {path}: {exc}") from exc
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    except OSError as exc:
+        raise InputError(f"cannot write {path}: {exc}") from exc
+    temporary = Path(temp_name)
+    try:
+        # mkstemp creates the file as 0600. Give the result the permissions
+        # an ordinary new file would get under the current umask.
+        umask = os.umask(0)
+        os.umask(umask)
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o666 & ~umask)
+        with os.fdopen(fd, "wb") as handle:
+            write(handle)
+        if force:
+            os.replace(temporary, path)
+        else:
+            _link_without_replacing(temporary, path)
+    except FileExistsError as exc:
+        raise InputError(
+            f"{path} already exists; pass --force to replace it. The existing file was not modified."
+        ) from exc
+    except OSError as exc:
         raise InputError(f"cannot write {path}: {exc}") from exc
     finally:
-        if temporary.exists():
+        try:
             temporary.unlink()
+        except OSError:
+            pass
+
+
+def _link_without_replacing(temporary: Path, path: Path) -> None:
+    """Put ``temporary`` at ``path`` only if nothing is there yet."""
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        raise
+    except OSError:
+        # Filesystems without hard links. Fall back to an exclusive create
+        # and copy, which still refuses to replace an existing file.
+        with temporary.open("rb") as source, path.open("xb") as target:
+            target.write(source.read())
 
 
 def _refuse_overwrite(path: Path, force: bool) -> None:

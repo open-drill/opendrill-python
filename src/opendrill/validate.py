@@ -21,7 +21,7 @@ import math
 from dataclasses import dataclass
 
 from opendrill.errors import PayloadError
-from opendrill.layout import MAX_PAGES, DEPTH_TOL_M, log_extent_m, sheet_count
+from opendrill.layout import MAX_PAGE_LINES, MAX_PAGES, DEPTH_TOL_M, log_extent_m, sheet_count
 from opendrill.series import is_spt
 
 SOIL_TYPES = ("ASPHALT", "CLAY", "GRAVEL", "SAND", "BACKFILL")
@@ -81,11 +81,14 @@ def _as_float(value: object) -> float:
     if isinstance(value, bool):
         raise ValueError("must be a finite number")
     if isinstance(value, (int, float)):
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError as exc:
+            raise ValueError("must be a finite number") from exc
     elif isinstance(value, str):
         try:
             number = float(value.strip())
-        except ValueError as exc:
+        except (ValueError, OverflowError) as exc:
             raise ValueError("must be a finite number") from exc
     else:
         raise ValueError("must be a finite number")
@@ -187,6 +190,9 @@ def validate_log(payload: dict) -> Validation:
         tests_in = payload.get("tests") or []
     tests = _tests(tests_in, num, errors, warnings)
     out["tests"] = tests
+    # "samples" is an input alias. The normalised payload carries only
+    # "tests", so it can be validated and rendered again.
+    out.pop("samples", None)
 
     piezo_in = payload.get("piezo") or {}
     if not isinstance(piezo_in, dict):
@@ -222,8 +228,8 @@ def validate_log(payload: dict) -> Validation:
         if pages > MAX_PAGES:
             errors.append((
                 ("depth_per_sheet_m",),
-                f"value {dps_value:g} m would create {pages} pages for an extent of "
-                f"{extent:g} m, above the limit of {MAX_PAGES}; increase depth_per_sheet_m",
+                f"value {dps_value:g} m would create more than {MAX_PAGES} pages for an "
+                f"extent of {extent:g} m; increase depth_per_sheet_m",
                 dps_value,
             ))
 
@@ -542,6 +548,15 @@ def _check_piezo(piezo: dict, errors: list, warnings: list[str]) -> None:
             "bottom_screen_m must be > top_screen_m (metres)",
             bottom,
         ))
+    spacing = piezo.get("screen_line_spacing_m")
+    if top is not None and bottom is not None and spacing is not None and bottom > top:
+        if (bottom - top) / spacing > MAX_PAGE_LINES:
+            errors.append((
+                ("piezo", "screen_line_spacing_m"),
+                f"would draw more than {MAX_PAGE_LINES} screen lines; "
+                f"use a spacing of at least {(bottom - top) / MAX_PAGE_LINES:g} metres",
+                spacing,
+            ))
     hole = piezo.get("bottom_depth_m")
     if top is not None and bottom is not None and hole is not None:
         if top < -DEPTH_TOL_M or bottom > hole + DEPTH_TOL_M:

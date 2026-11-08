@@ -1,0 +1,8 @@
+# Opens a PR when an action used in .github/workflows has a new release.
+# The workflows pin actions to commit SHAs, so without this they never update.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

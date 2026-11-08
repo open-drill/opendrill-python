@@ -1,6 +1,6 @@
 # Migration from the single-file generator
 
-The previous generator was one script (`soil_log.py`) that read an Excel workbook and drew a PDF with ReportLab. This package keeps that drawing and the workbook layout. The behavioural changes below are deliberate. They are the result of checking the original script against the cases it got wrong.
+The previous generator was a single Python script that read an Excel workbook and drew a PDF with ReportLab. This package keeps that drawing and the workbook layout. The behavioural changes below are deliberate. They are the result of checking the original script against the cases it got wrong.
 
 The original script's filled example (project, site, borehole id, map coordinates, personnel initials, and a drilling-contractor sentence) is not in this package. `opendrill example` writes a synthetic log labelled as such.
 
@@ -44,7 +44,7 @@ The original script's filled example (project, site, borehole id, map coordinate
 | Coordinates | Printed as stored. | Numbers must be finite. Text is still printed as entered. Optional `CRS`, `HORIZONTAL DATUM`, and `VERTICAL DATUM` are printed only when supplied. Nothing is assumed when they are blank. |
 | Water level and ground elevation | Non-numeric values were ignored. | A non-numeric water level or ground elevation is an error. Ground elevation may be negative. Water-level depth must be ≥ 0 metres. |
 | Page count | Unbounded. | More than 200 pages is an error that tells you to increase `depth_per_sheet_m` or shorten the text. Sheet numbers 10–200 stay in the footer; `OF` shifts right so the number is not clipped. |
-| Command | `python soil_log.py` | `opendrill`, including `render`, `validate`, `template`, and `example`. |
+| Command | `python <script>.py` | `opendrill`, including `render`, `validate`, `template`, and `example`. |
 
 ## Payload keys
 
