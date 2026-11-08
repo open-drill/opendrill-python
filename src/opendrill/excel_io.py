@@ -10,8 +10,9 @@ Duplicate keys in a KEY/VALUE sheet are an error; the last value does not win.
 """
 from __future__ import annotations
 
-import re
+import posixpath
 import zipfile
+import zlib
 from pathlib import Path
 from xml.etree.ElementTree import ParseError, iterparse
 
@@ -382,27 +383,53 @@ def _check_archive(path: Path) -> None:
     try:
         with zipfile.ZipFile(path) as archive:
             entries = archive.infolist()
-    except (zipfile.BadZipFile, OSError) as exc:
+            if len(entries) > MAX_WORKBOOK_ENTRIES:
+                raise InputError(
+                    f"{path.name} has {len(entries)} parts inside the workbook file; "
+                    f"the limit is {MAX_WORKBOOK_ENTRIES}"
+                )
+            total = sum(entry.file_size for entry in entries)
+            if total > MAX_WORKBOOK_UNCOMPRESSED_BYTES:
+                raise InputError(
+                    f"{path.name} expands to {total:,} bytes; the limit is "
+                    f"{MAX_WORKBOOK_UNCOMPRESSED_BYTES:,} bytes"
+                )
+            for part_name in sorted(_worksheet_parts(archive)):
+                with archive.open(part_name) as part:
+                    _scan_worksheet_xml(part, path.name, part_name)
+    except (zipfile.BadZipFile, OSError, EOFError, zlib.error,
+            RuntimeError, NotImplementedError, KeyError, ParseError) as exc:
         raise InputError(f"cannot open {path.name} as an Excel workbook: {exc}") from exc
-    if len(entries) > MAX_WORKBOOK_ENTRIES:
-        raise InputError(
-            f"{path.name} has {len(entries)} parts inside the workbook file; "
-            f"the limit is {MAX_WORKBOOK_ENTRIES}"
-        )
-    total = sum(entry.file_size for entry in entries)
-    if total > MAX_WORKBOOK_UNCOMPRESSED_BYTES:
-        raise InputError(
-            f"{path.name} expands to {total:,} bytes; the limit is "
-            f"{MAX_WORKBOOK_UNCOMPRESSED_BYTES:,} bytes"
-        )
-    with zipfile.ZipFile(path) as archive:
-        for entry in entries:
-            if _WORKSHEET_PART.fullmatch(entry.filename):
-                with archive.open(entry) as part:
-                    _scan_worksheet_xml(part, path.name, entry.filename)
 
 
-_WORKSHEET_PART = re.compile(r"xl/worksheets/[^/]+\.xml")
+def _worksheet_parts(archive: zipfile.ZipFile) -> set[str]:
+    """Find worksheet targets using the same relative-path rules as openpyxl.
+
+    Worksheet parts need not live in xl/worksheets or have an XML suffix.
+    Check relationships before loading any sheet, including relocated parts.
+    """
+    names = archive.namelist()
+    parts = {
+        name for name in names
+        if name.startswith("xl/worksheets/") and name.endswith(".xml")
+    }
+    for name in names:
+        if not name.endswith(".rels"):
+            continue
+        parent = posixpath.dirname(posixpath.dirname(name))
+        with archive.open(name) as stream:
+            for _event, element in iterparse(stream, events=("end",)):
+                if (element.tag.rsplit("}", 1)[-1] == "Relationship"
+                        and element.get("Type", "").endswith("/worksheet")):
+                    target = element.get("Target", "")
+                    if not target or element.get("TargetMode") == "External":
+                        raise InputError(f"{name}: worksheet must reference an internal part")
+                    parts.add(
+                        target[1:] if target.startswith("/")
+                        else posixpath.normpath(posixpath.join(parent, target))
+                    )
+                element.clear()
+    return parts
 
 
 def _scan_worksheet_xml(stream, workbook: str, part: str) -> None:
@@ -423,8 +450,7 @@ def _scan_worksheet_xml(stream, workbook: str, part: str) -> None:
                 cells += 1
             elif tag in ("mergeCell", "hyperlink"):
                 ref = element.get("ref")
-                if ref:
-                    cells += _range_area(ref, workbook, part, tag)
+                cells += _range_area(ref, workbook, part, tag)
             if cells > MAX_SHEET_CELLS:
                 raise InputError(
                     f"{workbook}: {part} would create more than {MAX_SHEET_CELLS:,} cells "
@@ -436,13 +462,17 @@ def _scan_worksheet_xml(stream, workbook: str, part: str) -> None:
         raise InputError(f"cannot open {workbook} as an Excel workbook: {part}: {exc}") from exc
 
 
-def _range_area(ref: str, workbook: str, part: str, tag: str) -> int:
+def _range_area(ref: str | None, workbook: str, part: str, tag: str) -> int:
     try:
-        min_col, min_row, max_col, max_row = range_boundaries(ref.split()[0])
-    except (TypeError, ValueError):
-        return 1
+        if not isinstance(ref, str) or not ref.strip() or len(ref.split()) != 1:
+            raise ValueError("expected one cell range")
+        min_col, min_row, max_col, max_row = range_boundaries(ref)
+    except (TypeError, ValueError) as exc:
+        raise InputError(f"{workbook}: {part} has an invalid {tag} range ({ref!r})") from exc
     if None in (min_col, min_row, max_col, max_row):
         raise InputError(f"{workbook}: {part} has a {tag} over whole rows or columns ({ref!r})")
+    if min_row < 1 or min_col < 1 or max_row < min_row or max_col < min_col:
+        raise InputError(f"{workbook}: {part} has an invalid {tag} range ({ref!r})")
     if max_row > MAX_SHEET_ROWS or max_col > MAX_SHEET_COLUMNS:
         raise InputError(
             f"{workbook}: {part} has a {tag} {ref!r} that reaches row {max_row}, column "
