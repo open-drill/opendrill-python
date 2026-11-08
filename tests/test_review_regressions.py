@@ -389,3 +389,114 @@ def test_a_point_just_past_a_sheet_end_has_exactly_one_page(dps, offset):
     owners = [w for w in windows if contains_point(depth, *w)]
     assert len(owners) == 1, (dps, offset, windows)
     assert owners[0] == windows[-1]
+
+
+# Third review
+
+
+def _inject_into_sheet(source: Path, target: Path, sheet_title: str, xml: str, before: str) -> None:
+    """Copy a workbook, inserting raw XML into one worksheet part before ``before``."""
+    import zipfile
+
+    from openpyxl import load_workbook
+
+    titles = load_workbook(source).sheetnames
+    part = f"xl/worksheets/sheet{titles.index(sheet_title) + 1}.xml"
+    with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as dst:
+        for item in src.infolist():
+            data = src.read(item)
+            if item.filename == part:
+                text = data.decode("utf-8")
+                assert before in text, part
+                data = text.replace(before, xml + before, 1).encode("utf-8")
+            dst.writestr(item, data)
+
+
+@pytest.mark.parametrize(
+    "xml",
+    [
+        '<mergeCells count="1"><mergeCell ref="A3:CV100000"/></mergeCells>',
+        '<mergeCells count="1"><mergeCell ref="A3:BL4500"/></mergeCells>',
+    ],
+)
+def test_oversized_merged_range_rejected_before_loading(tmp_path: Path, xml: str):
+    base = tmp_path / "base.xlsx"
+    build_workbook(synthetic_payload(), filled=True).save(base)
+    bad = tmp_path / "merged.xlsx"
+    _inject_into_sheet(base, bad, "Samples", xml, "<pageMargins")
+    assert bad.stat().st_size < 100_000
+    started = time.monotonic()
+    with pytest.raises(InputError):
+        read_workbook(bad)
+    assert time.monotonic() - started < 5
+
+
+def test_oversized_hyperlink_range_rejected_before_loading(tmp_path: Path):
+    base = tmp_path / "base.xlsx"
+    build_workbook(synthetic_payload(), filled=True).save(base)
+    bad = tmp_path / "link.xlsx"
+    xml = '<hyperlinks><hyperlink ref="A3:CV100000" display="x" location="Layers!A1"/></hyperlinks>'
+    _inject_into_sheet(base, bad, "Samples", xml, "<pageMargins")
+    started = time.monotonic()
+    with pytest.raises(InputError):
+        read_workbook(bad)
+    assert time.monotonic() - started < 5
+
+
+def test_small_merged_ranges_still_read(tmp_path: Path):
+    workbook = build_workbook(synthetic_payload(), filled=True)
+    workbook["Project"].merge_cells("D1:F2")
+    path = tmp_path / "merged-ok.xlsx"
+    workbook.save(path)
+    assert read_workbook(path).payload["layers"]
+
+
+def test_notes_do_not_overlap_long_shallow_layer_description():
+    from opendrill.render import _frame, _layout_page_text, _wrap_paragraphs
+
+    payload = validate_log(
+        {
+            "layers": [{"depth_start_m": 0, "depth_end_m": 0.1, "desc": "SYNTHETIC description " * 20}],
+            "notes": "ENDNOTE",
+            "termination_depth_m": 0.1 + 1e-3,
+        }
+    ).payload
+    frame = _frame()
+    notes = _wrap_paragraphs(payload["notes"], frame.col_w)
+    page = _layout_page_text(payload, (0.0, 20.0), frame, "start", notes)
+    desc_baselines = [y for _x, y, text, _f, _s in page.texts if text.startswith("SYNTHETIC")]
+    after = [y for _x, y, text, _f, _s in page.texts if not text.startswith("SYNTHETIC")]
+    assert desc_baselines and after
+    assert max(after) < min(desc_baselines), (min(desc_baselines), max(after))
+
+
+def test_zero_spacing_with_complete_screen_returns_payload_error(tmp_path: Path, capsys):
+    payload = {"piezo": {"top_screen_m": 0, "bottom_screen_m": 1, "screen_line_spacing_m": 0}}
+    with pytest.raises(PayloadError):
+        validate_log(payload)
+    source = tmp_path / "zero.json"
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    assert main(["validate", str(source)]) == 2
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"info": {"COORDINATES (M) N": 10**400}},
+        {"tests": [{"depth_top_m": 1, "depth_bot_m": 2, "test": "SPT", "spt2": 10**400, "spt3": 1}]},
+        {"depth_per_sheet_m": 5e-324},
+        {"depth_per_sheet_m": 0.001},
+    ],
+)
+def test_extreme_coordinates_blows_and_sheet_lengths_fail_cleanly(payload):
+    with pytest.raises(PayloadError):
+        validate_log(payload)
+    with pytest.raises(PayloadError):
+        render_log(payload)
+
+
+def test_json_integer_digit_limit_returns_exit_two(tmp_path: Path, capsys):
+    source = tmp_path / "digits.json"
+    source.write_text('{"termination_depth_m": ' + "9" * 5000 + "}", encoding="utf-8")
+    assert main(["validate", str(source)]) == 2
+    assert "number that cannot be read" in capsys.readouterr().err

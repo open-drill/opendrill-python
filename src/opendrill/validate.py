@@ -68,6 +68,8 @@ _MEASUREMENT_FIELDS = (
 
 _MISSING = object()
 
+MIN_DEPTH_PER_SHEET_M = 0.01
+
 
 @dataclass(frozen=True)
 class Validation:
@@ -101,6 +103,10 @@ def _as_int(value: object) -> int:
     if isinstance(value, bool):
         raise ValueError("must be a whole number")
     if isinstance(value, int):
+        try:
+            float(value)
+        except OverflowError as exc:
+            raise ValueError("must be a whole number of a plottable size") from exc
         return value
     number = _as_float(value)
     if not number.is_integer():
@@ -149,7 +155,9 @@ def validate_log(payload: dict) -> Validation:
     if dps is _MISSING or dps is None or (isinstance(dps, str) and not str(dps).strip()):
         out["depth_per_sheet_m"] = 20.0
     else:
-        parsed = num(dps, ("depth_per_sheet_m",), gt=0, unit="metres")
+        # 1 cm is far below any real sheet length. The floor keeps tick and
+        # grid steps representable (5e-324 m once reached log10(0)).
+        parsed = num(dps, ("depth_per_sheet_m",), ge=MIN_DEPTH_PER_SHEET_M, unit="metres")
         out["depth_per_sheet_m"] = 20.0 if parsed is None else parsed
 
     info_in = payload.get("info") or {}
@@ -269,10 +277,13 @@ def _check_optional_finite(info: dict, key: str, errors: list) -> None:
         errors.append((("info", key), "must be a finite number or text", value))
         return
     if isinstance(value, (int, float)):
-        if not math.isfinite(float(value)):
+        try:
+            number = float(value)
+        except OverflowError:
+            number = math.inf
+        if not math.isfinite(number):
             errors.append((("info", key), "must be a finite number", value))
             return
-        number = float(value)
         info[key] = int(number) if number.is_integer() else number
         return
     info[key] = str(value).strip()
@@ -574,7 +585,7 @@ def _check_piezo(piezo: dict, errors: list, warnings: list[str]) -> None:
             bottom,
         ))
     spacing = piezo.get("screen_line_spacing_m")
-    if top is not None and bottom is not None and spacing is not None and bottom > top:
+    if top is not None and bottom is not None and spacing is not None and spacing > 0 and bottom > top:
         if (bottom - top) / spacing > MAX_PAGE_LINES:
             errors.append((
                 ("piezo", "screen_line_spacing_m"),

@@ -70,7 +70,7 @@ The root is an object. Depths are metres. Strength is kilopascals. Percent field
 
 | Field | Unit | Rule |
 | --- | --- | --- |
-| `depth_per_sheet_m` | m | Finite and > 0. Default 20. A value that would create more than 200 pages is rejected. |
+| `depth_per_sheet_m` | m | Finite and ≥ 0.01. Default 20. A value that would create more than 200 pages is rejected. |
 | `termination_depth_m` | m | Optional end-of-hole depth. Pagination includes it. If it is shallower than other data, the deeper data is kept and a warning is printed. |
 | `notes` | text | A string, or a list of strings joined with newlines. |
 | `layers[]` | | One object per layer. |

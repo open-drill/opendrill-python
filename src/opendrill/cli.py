@@ -261,6 +261,10 @@ def _parse_json(raw: bytes, label: str) -> dict:
         raise InputError(f"{label}: invalid JSON ({exc})") from exc
     except RecursionError as exc:
         raise InputError(f"{label}: JSON is nested too deeply") from exc
+    except ValueError as exc:
+        # Python refuses to convert integer literals with thousands of digits
+        # (sys.set_int_max_str_digits); json.loads raises a plain ValueError.
+        raise InputError(f"{label}: JSON contains a number that cannot be read ({exc})") from exc
     if not isinstance(data, dict):
         raise InputError(f"{label}: JSON root must be an object")
     return data

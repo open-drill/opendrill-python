@@ -479,8 +479,14 @@ def _layout_page_text(payload, window, frame: Frame, notes_mode: str, note_lines
     if closing is not None and closing >= frame.gy_bot:
         page.lines.append((frame.mx_l, closing, frame.mx_r, closing, 0.4))
 
-    termination = payload.get("termination_depth_m")
+    # Text placed after the layers (termination caption, notes) must start
+    # below the layer boundary and below the last description line drawn on
+    # this page, which can run past a thin layer's physical bottom.
     notes_anchor = closing
+    if last_baseline is not None:
+        text_floor = last_baseline - _DESC_FS * 0.3
+        notes_anchor = text_floor if notes_anchor is None else min(notes_anchor, text_floor)
+    termination = payload.get("termination_depth_m")
     if termination is not None and contains_point(float(termination), start, end):
         term_y = _y_of(float(termination), window, frame)
         layer_ends = [layer["depth_end_m"] for layer in visible]
@@ -488,6 +494,8 @@ def _layout_page_text(payload, window, frame: Frame, notes_mode: str, note_lines
         if not already:
             caption = f"Termination depth (supplied) {format_depth(float(termination))} m"
             baseline = term_y - _PAD_Y - _DESC_FS
+            if last_baseline is not None:
+                baseline = min(baseline, last_baseline - _LINE_H)
             if baseline >= frame.gy_bot:
                 page.texts.append((frame.mx_l + _PAD_X, baseline, caption, "Helvetica-Oblique", _DESC_FS))
                 notes_anchor = baseline

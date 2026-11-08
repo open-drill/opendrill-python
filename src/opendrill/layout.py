@@ -115,6 +115,8 @@ def _nice_step(span: float, target_divisions: int) -> float:
     if span <= 0 or not math.isfinite(span):
         raise ValueError("span must be finite and positive")
     raw = span / max(target_divisions, 1)
+    if raw <= 0 or not math.isfinite(raw):
+        raise ValueError("span is too small to divide into ticks")
     exp = math.floor(math.log10(raw))
     base = 10.0 ** exp
     frac = raw / base

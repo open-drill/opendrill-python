@@ -10,13 +10,15 @@ Duplicate keys in a KEY/VALUE sheet are an error; the last value does not win.
 """
 from __future__ import annotations
 
+import re
 import zipfile
 from pathlib import Path
+from xml.etree.ElementTree import ParseError, iterparse
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from opendrill.errors import InputError, PayloadError
@@ -393,6 +395,60 @@ def _check_archive(path: Path) -> None:
             f"{path.name} expands to {total:,} bytes; the limit is "
             f"{MAX_WORKBOOK_UNCOMPRESSED_BYTES:,} bytes"
         )
+    with zipfile.ZipFile(path) as archive:
+        for entry in entries:
+            if _WORKSHEET_PART.fullmatch(entry.filename):
+                with archive.open(entry) as part:
+                    _scan_worksheet_xml(part, path.name, entry.filename)
+
+
+_WORKSHEET_PART = re.compile(r"xl/worksheets/[^/]+\.xml")
+
+
+def _scan_worksheet_xml(stream, workbook: str, part: str) -> None:
+    """Bound what openpyxl will create for one worksheet, before it parses it.
+
+    openpyxl creates a cell object for every stored ``<c>`` element and for
+    every cell inside a ``<mergeCell>`` or ``<hyperlink>`` range. A few
+    bytes of XML can name a range of millions of cells, so stored cells and
+    the area of those ranges are counted here, streaming, and checked
+    against :data:`MAX_SHEET_CELLS`, :data:`MAX_SHEET_ROWS`, and
+    :data:`MAX_SHEET_COLUMNS`.
+    """
+    cells = 0
+    try:
+        for _event, element in iterparse(stream, events=("end",)):
+            tag = element.tag.rsplit("}", 1)[-1]
+            if tag == "c":
+                cells += 1
+            elif tag in ("mergeCell", "hyperlink"):
+                ref = element.get("ref")
+                if ref:
+                    cells += _range_area(ref, workbook, part, tag)
+            if cells > MAX_SHEET_CELLS:
+                raise InputError(
+                    f"{workbook}: {part} would create more than {MAX_SHEET_CELLS:,} cells "
+                    "(stored, merged, or hyperlinked); the file is not a borehole log this "
+                    "package can read"
+                )
+            element.clear()
+    except ParseError as exc:
+        raise InputError(f"cannot open {workbook} as an Excel workbook: {part}: {exc}") from exc
+
+
+def _range_area(ref: str, workbook: str, part: str, tag: str) -> int:
+    try:
+        min_col, min_row, max_col, max_row = range_boundaries(ref.split()[0])
+    except (TypeError, ValueError):
+        return 1
+    if None in (min_col, min_row, max_col, max_row):
+        raise InputError(f"{workbook}: {part} has a {tag} over whole rows or columns ({ref!r})")
+    if max_row > MAX_SHEET_ROWS or max_col > MAX_SHEET_COLUMNS:
+        raise InputError(
+            f"{workbook}: {part} has a {tag} {ref!r} that reaches row {max_row}, column "
+            f"{max_col}; the limit is {MAX_SHEET_ROWS} rows and {MAX_SHEET_COLUMNS} columns"
+        )
+    return (max_row - min_row + 1) * (max_col - min_col + 1)
 
 
 def _value_extent(ws, name: str) -> tuple[int, int]:
