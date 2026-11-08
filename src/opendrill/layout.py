@@ -235,16 +235,15 @@ def sheet_count(extent_m: float, depth_per_sheet_m: float) -> int:
         raise ValueError("depth_per_sheet_m must be finite and positive")
     if extent_m <= DEPTH_TOL_M:
         return 1
-    ratio = extent_m / depth_per_sheet_m
+    # Same tolerance as contains_point: a depth up to DEPTH_TOL_M past a
+    # sheet end belongs to that sheet, so it must not open another one, and
+    # anything deeper must.
+    ratio = (extent_m - DEPTH_TOL_M) / depth_per_sheet_m
     if not math.isfinite(ratio) or ratio > 10 * MAX_PAGES:
         # Callers compare against MAX_PAGES. Report "too many" without
         # rounding an infinite or astronomically large ratio.
         return 10 * MAX_PAGES + 1
-    if abs(ratio - round(ratio)) <= 1e-6:
-        count = int(round(ratio))
-    else:
-        count = math.ceil(ratio - 1e-12)
-    return max(1, count)
+    return max(1, math.ceil(ratio - 1e-9))
 
 
 def data_page_windows(

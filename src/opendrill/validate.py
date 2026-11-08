@@ -381,7 +381,7 @@ def _tests(rows: object, num, errors: list, warnings: list[str]) -> list[dict]:
         ):
             continue
         item = dict(row)
-        item.pop("su_source", None)
+        prior_source = item.pop("su_source", None)
         for field in _TEST_INT_FIELDS:
             lower = 0 if field in ("spt1", "spt2", "spt3") else None
             unit = "blows" if field in ("spt1", "spt2", "spt3") else None
@@ -419,7 +419,7 @@ def _tests(rows: object, num, errors: list, warnings: list[str]) -> list[dict]:
                 kind,
             ))
             item["su_kind"] = None
-        _apply_strength(item, index, warnings)
+        _apply_strength(item, index, warnings, prior_source)
         if is_spt(item):
             has_2 = item["spt2"] is not None
             has_3 = item["spt3"] is not None
@@ -466,13 +466,28 @@ def _check_sample_interval(item: dict, index: int, errors: list) -> None:
         ))
 
 
-def _apply_strength(item: dict, index: int, warnings: list[str]) -> None:
-    """Plot ``su_kPa`` as entered. Derive Su from uc/ppen only when it was omitted."""
+def _apply_strength(item: dict, index: int, warnings: list[str], prior_source: object = None) -> None:
+    """Plot ``su_kPa`` as entered. Derive Su from uc/ppen only when it was omitted.
+
+    ``prior_source`` is the ``su_source`` already on the row. A payload that
+    was validated before carries the derived ``su_kPa``; when it still equals
+    half of the matching reading, the ``uc/2`` or ``ppen/2`` label is kept
+    instead of being relabelled ``given``.
+    """
     kind = item.get("su_kind")
     su = item.get("su_kPa")
     uc = item.get("uc_kPa")
     ppen = item.get("ppen_kPa")
     if su is not None:
+        derived_from = {"uc/2": ("uc", uc), "ppen/2": ("ppen", ppen)}.get(str(prior_source))
+        if (
+            derived_from is not None
+            and kind == derived_from[0]
+            and derived_from[1] is not None
+            and math.isclose(su, derived_from[1] / 2.0, rel_tol=1e-9, abs_tol=1e-9)
+        ):
+            item["su_source"] = prior_source
+            return
         item["su_source"] = "given"
         if not kind:
             warnings.append(
@@ -498,10 +513,20 @@ def _apply_strength(item: dict, index: int, warnings: list[str]) -> None:
     if kind == "uc" and uc is not None:
         item["su_kPa"] = uc / 2.0
         item["su_source"] = "uc/2"
+        if ppen is not None:
+            warnings.append(
+                f"tests.{index}: su_kind is uc, so Su is uc_kPa / 2; ppen_kPa "
+                f"({ppen:g} kPa) is kept on the row but not plotted"
+            )
         return
     if kind == "ppen" and ppen is not None:
         item["su_kPa"] = ppen / 2.0
         item["su_source"] = "ppen/2"
+        if uc is not None:
+            warnings.append(
+                f"tests.{index}: su_kind is ppen, so Su is ppen_kPa / 2; uc_kPa "
+                f"({uc:g} kPa) is kept on the row but not plotted"
+            )
         return
     item["su_source"] = None
     if kind:

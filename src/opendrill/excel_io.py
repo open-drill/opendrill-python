@@ -293,18 +293,10 @@ def build_workbook(payload: dict | None, *, filled: bool = True) -> Workbook:
             "desc": "<- delete this example row",
         }] if not filled else []
     _table_sheet(wb, "Layers", LAYER_COLS, layer_rows or [], dropdowns={3: list(SOIL_TYPES)})
+    # The blank template has no example sample row and no example note. Either
+    # would be drawn on the PDF as if it were data. Column comments and the
+    # dropdowns carry the guidance instead.
     test_rows = payload.get("tests") if payload else None
-    if not test_rows and not payload:
-        test_rows = [{
-            "no": 1,
-            "test": "SPT",
-            "depth_top_m": 1.0,
-            "depth_bot_m": 1.5,
-            "recovery": 50,
-            "spt1": 1,
-            "spt2": 2,
-            "spt3": 3,
-        }] if not filled else []
     _table_sheet(
         wb,
         "Samples",
@@ -317,19 +309,21 @@ def build_workbook(payload: dict | None, *, filled: bool = True) -> Workbook:
         piezo = {"screen_line_spacing_m": 0.1} if not filled else None
     _piezo_sheet(wb, piezo)
     notes = payload.get("notes") if payload else None
-    if not notes and not payload:
-        notes = "Free-text notes; one row per line." if not filled else ""
     _notes_sheet(wb, notes)
     _meta_sheet(wb, payload, filled and not payload)
     return wb
 
 
 def _find_sheet(wb, canonical_key: str) -> str | None:
+    """The one sheet matching ``canonical_key``'s aliases. Two matches are an error."""
     candidates = {name.lower() for name in SHEET_ALIASES.get(canonical_key, ())}
-    for name in wb.sheetnames:
-        if name.lower() in candidates:
-            return name
-    return None
+    matches = [name for name in wb.sheetnames if name.lower() in candidates]
+    if len(matches) > 1:
+        raise InputError(
+            f"sheets {', '.join(repr(name) for name in matches)} are aliases of the same sheet; "
+            "keep one and delete or rename the others, so no rows are silently ignored"
+        )
+    return matches[0] if matches else None
 
 
 def _normalize_value(value):

@@ -182,10 +182,10 @@ def _write_template(path: Path, force: bool) -> int:
     from opendrill.excel_io import build_workbook
 
     try:
-        _save_workbook(build_workbook(None, filled=False), path, force)
+        written = _save_workbook(build_workbook(None, filled=False), path, force)
     except InputError as exc:
         return _die(str(exc))
-    print(f"workbook: {path}")
+    print(f"workbook: {written}")
     return 0
 
 
@@ -202,10 +202,10 @@ def _write_example(kind: str, path: Path, force: bool) -> int:
         from opendrill.excel_io import build_workbook
 
         try:
-            _save_workbook(build_workbook(payload, filled=True), path, force)
+            written = _save_workbook(build_workbook(payload, filled=True), path, force)
         except InputError as exc:
             return _die(str(exc))
-        print(f"workbook: {path}")
+        print(f"workbook: {written}")
         return 0
     from opendrill.render import render_log
 
@@ -325,10 +325,12 @@ def _write_text(path: Path, text: str, force: bool) -> None:
     _write_atomic(path, lambda handle: handle.write(text.encode("utf-8")), force)
 
 
-def _save_workbook(workbook, path: Path, force: bool) -> None:
+def _save_workbook(workbook, path: Path, force: bool) -> Path:
+    """Save ``workbook``, adding ``.xlsx`` when needed. Returns the path written."""
     if path.suffix.lower() not in (".xlsx", ".xlsm"):
         path = path.with_suffix(".xlsx")
     _write_atomic(path, workbook.save, force)
+    return path
 
 
 def _write_atomic(path: Path, write: Callable[[IO[bytes]], object], force: bool) -> None:

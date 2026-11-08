@@ -316,3 +316,76 @@ def test_readme_quickstart_commands_run_in_sequence(tmp_path: Path, monkeypatch)
     for command in commands:
         assert command[0] == "opendrill"
         assert main(command[1:]) == 0, command
+
+
+# Second review (of cb13a56)
+
+
+def test_blank_template_draws_nothing_but_the_marked_layer(tmp_path: Path):
+    path = tmp_path / "blank.xlsx"
+    build_workbook(None, filled=False).save(path)
+    data = read_workbook(path)
+    assert data.payload["tests"] == []
+    assert data.payload["notes"] == ""
+    from opendrill.excel_io import input_warnings
+
+    assert any("delete this example row" in warning for warning in input_warnings(data))
+
+
+def test_two_sample_sheet_aliases_are_an_error(tmp_path: Path):
+    workbook = build_workbook(synthetic_payload(), filled=True)
+    extra = workbook.copy_worksheet(workbook["Samples"])
+    extra.title = "tests"
+    path = tmp_path / "aliases.xlsx"
+    workbook.save(path)
+    with pytest.raises(InputError, match="aliases of the same sheet"):
+        read_workbook(path)
+
+
+def test_a_word_wider_than_the_column_is_broken_to_fit():
+    from reportlab.pdfbase import pdfmetrics
+
+    from opendrill.render import _DESC_FS, _wrap_text
+
+    lines = _wrap_text("start " + "X" * 80 + " end", 190)
+    assert len(lines) >= 3
+    for line in lines:
+        assert pdfmetrics.stringWidth(line, "Helvetica", _DESC_FS) <= 190
+    assert "".join(lines).replace(" ", "") == "start" + "X" * 80 + "end"
+
+
+def test_template_without_suffix_prints_the_path_written(tmp_path: Path, capsys):
+    target = tmp_path / "nosuffix"
+    assert main(["template", "--out", str(target)]) == 0
+    written = tmp_path / "nosuffix.xlsx"
+    assert written.exists()
+    assert f"workbook: {written}" in capsys.readouterr().out
+
+
+def test_derived_su_keeps_its_source_when_validated_again():
+    once = validate_log({"tests": [{"depth_top_m": 1, "depth_bot_m": 1.5, "su_kind": "uc", "uc_kPa": 280}]})
+    row = once.payload["tests"][0]
+    assert (row["su_kPa"], row["su_source"]) == (140, "uc/2")
+    twice = validate_log(once.payload).payload["tests"][0]
+    assert (twice["su_kPa"], twice["su_source"]) == (140, "uc/2")
+
+    edited = dict(once.payload, tests=[dict(row, su_kPa=100)])
+    assert validate_log(edited).payload["tests"][0]["su_source"] == "given"
+
+
+def test_unused_strength_reading_is_reported():
+    checked = validate_log(
+        {"tests": [{"depth_top_m": 1, "depth_bot_m": 1.5, "su_kind": "uc", "uc_kPa": 280, "ppen_kPa": 90}]}
+    )
+    assert checked.payload["tests"][0]["su_kPa"] == 140
+    assert any("ppen_kPa (90 kPa) is kept on the row but not plotted" in w for w in checked.warnings)
+
+
+@pytest.mark.parametrize("dps", [10.0, 0.3, 2.05, 20.0])
+@pytest.mark.parametrize("offset", [0.0, 5e-7, 1e-6, 5e-6, 1e-5, 1.5e-5, 1e-4, 0.01])
+def test_a_point_just_past_a_sheet_end_has_exactly_one_page(dps, offset):
+    depth = dps + offset
+    windows = data_page_windows(depth, dps)
+    owners = [w for w in windows if contains_point(depth, *w)]
+    assert len(owners) == 1, (dps, offset, windows)
+    assert owners[0] == windows[-1]

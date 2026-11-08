@@ -334,7 +334,7 @@ def _wrap_text(text: str, max_w: float, font: str = "Helvetica", size: float = _
         return []
     lines: list[str] = []
     current = ""
-    for word in words:
+    for word in _split_long_words(words, max_w, font, size):
         trial = word if not current else f"{current} {word}"
         if pdfmetrics.stringWidth(trial, font, size) <= max_w:
             current = trial
@@ -345,6 +345,25 @@ def _wrap_text(text: str, max_w: float, font: str = "Helvetica", size: float = _
     if current:
         lines.append(current)
     return lines
+
+
+def _split_long_words(words: list[str], max_w: float, font: str, size: float) -> list[str]:
+    """Break any word wider than ``max_w`` into pieces that fit, character by character."""
+    out: list[str] = []
+    for word in words:
+        if pdfmetrics.stringWidth(word, font, size) <= max_w:
+            out.append(word)
+            continue
+        piece = ""
+        for char in word:
+            if piece and pdfmetrics.stringWidth(piece + char, font, size) > max_w:
+                out.append(piece)
+                piece = char
+            else:
+                piece += char
+        if piece:
+            out.append(piece)
+    return out
 
 
 def _wrap_paragraphs(text: str, max_w: float) -> list[str]:

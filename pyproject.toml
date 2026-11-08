@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opendrill"
-version = "0.1.0"
+version = "0.1.1"
 description = "Render a soil or borehole log PDF from JSON or an Excel workbook."
 readme = "README.md"
 requires-python = ">=3.10"

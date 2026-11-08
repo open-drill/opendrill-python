@@ -144,7 +144,7 @@ Sheet names are case-insensitive. Aliases from the original script still work: `
 
 Do not put formulas in value cells unless Excel has saved a cached result. A formula with an empty cache is an error, because reading it as a blank would drop the number. A cached result is used, and a warning says it may be stale. This package does not calculate formulas. Duplicate keys in a KEY/VALUE sheet are an error; the later row does not replace the earlier one.
 
-`opendrill template` writes the column comments, dropdowns, and a placeholder layer row whose description contains `<- delete this example row`. Leaving that row in produces a warning.
+`opendrill template` writes the column comments, dropdowns, and one placeholder layer row whose description contains `<- delete this example row`. Leaving that row in produces a warning. The template has no example sample or note, so nothing else from it is drawn on the PDF.
 
 ## For an automated agent
 
@@ -166,7 +166,7 @@ python -m pip install build
 python -m build
 ```
 
-CI runs the tests on Python 3.10 and 3.12 and installs the built wheel in a clean virtual environment.
+CI runs the tests on Python 3.10, 3.11, and 3.12 and installs the built wheel in a clean virtual environment.
 
 ## Provenance
 
